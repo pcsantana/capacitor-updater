@@ -12,8 +12,15 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
 import android.os.Build;
+import android.os.Handler;
 import android.os.Looper;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.ProgressBar;
 import com.getcapacitor.CapConfig;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -79,6 +86,9 @@ public class CapacitorUpdaterPlugin extends Plugin {
     private Boolean taskRunning = false;
     private Boolean keepUrlPathAfterReload = false;
     private Boolean autoSplashscreen = false;
+    private Boolean autoSplashscreenLoader = false;
+    private Integer autoSplashscreenTimeout = 10000;
+    private Boolean autoSplashscreenTimedOut = false;
     private String directUpdateMode = "false";
     private Boolean wasRecentlyInstalledOrUpdated = false;
     Boolean shakeMenuEnabled = false;
@@ -96,6 +106,9 @@ public class CapacitorUpdaterPlugin extends Plugin {
     private DelayUpdateUtils delayUpdateUtils;
 
     private ShakeMenu shakeMenu;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private FrameLayout splashscreenLoaderOverlay;
+    private Runnable splashscreenTimeoutRunnable;
 
     private JSObject mapToJSObject(Map<String, Object> map) {
         JSObject jsObject = new JSObject();
@@ -258,6 +271,9 @@ public class CapacitorUpdaterPlugin extends Plugin {
         this.appReadyTimeout = this.getConfig().getInt("appReadyTimeout", 10000);
         this.keepUrlPathAfterReload = this.getConfig().getBoolean("keepUrlPathAfterReload", false);
         this.autoSplashscreen = this.getConfig().getBoolean("autoSplashscreen", false);
+        this.autoSplashscreenLoader = this.getConfig().getBoolean("autoSplashscreenLoader", false);
+        int splashscreenTimeoutValue = this.getConfig().getInt("autoSplashscreenTimeout", 10000);
+        this.autoSplashscreenTimeout = Math.max(0, splashscreenTimeoutValue);
         this.implementation.timeout = this.getConfig().getInt("responseTimeout", 20) * 1000;
         this.shakeMenuEnabled = this.getConfig().getBoolean("shakeMenu", false);
         boolean resetWhenUpdate = this.getConfig().getBoolean("resetWhenUpdate", true);
@@ -317,7 +333,23 @@ public class CapacitorUpdaterPlugin extends Plugin {
     }
 
     private void hideSplashscreen() {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            hideSplashscreenInternal();
+        } else {
+            this.mainHandler.post(this::hideSplashscreenInternal);
+        }
+    }
+
+    private void hideSplashscreenInternal() {
+        cancelSplashscreenTimeout();
+        removeSplashscreenLoader();
+
         try {
+            if (getBridge() == null) {
+                logger.warn("Bridge not ready for hiding splashscreen with autoSplashscreen");
+                return;
+            }
+
             // Try to call the SplashScreen plugin directly through the bridge
             PluginHandle splashScreenPlugin = getBridge().getPlugin("SplashScreen");
             if (splashScreenPlugin != null) {
@@ -355,53 +387,140 @@ public class CapacitorUpdaterPlugin extends Plugin {
     }
 
     private void showSplashscreen() {
-        try {
-            // Show splashscreen immediately and synchronously when backgrounding
-            if (getBridge() == null) {
-                logger.warn("Bridge not ready for showing splashscreen with autoSplashscreen");
-                return;
-            }
-
-            // Execute immediately on current thread if it's main, otherwise post to main thread
-            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
-                showSplashscreenNow();
-            } else {
-                // Use runOnUiThread for immediate execution on main thread
-                if (getActivity() != null) {
-                    getActivity().runOnUiThread(() -> showSplashscreenNow());
-                } else {
-                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> showSplashscreenNow());
-                }
-            }
-        } catch (Exception e) {
-            logger.error("Error showing splashscreen when backgrounding: " + e.getMessage());
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            showSplashscreenNow();
+        } else {
+            this.mainHandler.post(this::showSplashscreenNow);
         }
     }
 
     private void showSplashscreenNow() {
+        cancelSplashscreenTimeout();
+        this.autoSplashscreenTimedOut = false;
+
         try {
-            PluginHandle splashScreenPlugin = getBridge().getPlugin("SplashScreen");
-            if (splashScreenPlugin != null) {
-                JSObject options = new JSObject();
-                java.lang.reflect.Field msgHandlerField = getBridge().getClass().getDeclaredField("msgHandler");
-                msgHandlerField.setAccessible(true);
-                Object msgHandler = msgHandlerField.get(getBridge());
-
-                PluginCall call = new PluginCall(
-                    (com.getcapacitor.MessageHandler) msgHandler,
-                    "SplashScreen",
-                    "FAKE_CALLBACK_ID_SHOW",
-                    "show",
-                    options
-                );
-
-                splashScreenPlugin.invoke("show", call);
-                logger.info("Splashscreen shown synchronously to prevent flash");
+            if (getBridge() == null) {
+                logger.warn("Bridge not ready for showing splashscreen with autoSplashscreen");
             } else {
-                logger.warn("autoSplashscreen: SplashScreen plugin not found");
+                PluginHandle splashScreenPlugin = getBridge().getPlugin("SplashScreen");
+                if (splashScreenPlugin != null) {
+                    JSObject options = new JSObject();
+                    java.lang.reflect.Field msgHandlerField = getBridge().getClass().getDeclaredField("msgHandler");
+                    msgHandlerField.setAccessible(true);
+                    Object msgHandler = msgHandlerField.get(getBridge());
+
+                    PluginCall call = new PluginCall(
+                        (com.getcapacitor.MessageHandler) msgHandler,
+                        "SplashScreen",
+                        "FAKE_CALLBACK_ID_SHOW",
+                        "show",
+                        options
+                    );
+
+                    splashScreenPlugin.invoke("show", call);
+                    logger.info("Splashscreen shown synchronously to prevent flash");
+                } else {
+                    logger.warn("autoSplashscreen: SplashScreen plugin not found");
+                }
             }
         } catch (Exception e) {
             logger.error("Failed to show splashscreen synchronously: " + e.getMessage());
+        }
+
+        addSplashscreenLoaderIfNeeded();
+        scheduleSplashscreenTimeout();
+    }
+
+    private void addSplashscreenLoaderIfNeeded() {
+        if (!Boolean.TRUE.equals(this.autoSplashscreenLoader)) {
+            return;
+        }
+
+        Runnable addLoader = () -> {
+            if (this.splashscreenLoaderOverlay != null) {
+                return;
+            }
+
+            Activity activity = getActivity();
+            if (activity == null) {
+                logger.warn("autoSplashscreen: Activity not available for loader overlay");
+                return;
+            }
+
+            ProgressBar progressBar = new ProgressBar(activity);
+            progressBar.setIndeterminate(true);
+
+            FrameLayout overlay = new FrameLayout(activity);
+            overlay.setLayoutParams(
+                new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            );
+            overlay.setClickable(false);
+            overlay.setFocusable(false);
+            overlay.setBackgroundColor(Color.TRANSPARENT);
+            overlay.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            params.gravity = Gravity.CENTER;
+            overlay.addView(progressBar, params);
+
+            ViewGroup decorView = (ViewGroup) activity.getWindow().getDecorView();
+            decorView.addView(overlay);
+
+            this.splashscreenLoaderOverlay = overlay;
+        };
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            addLoader.run();
+        } else {
+            this.mainHandler.post(addLoader);
+        }
+    }
+
+    private void removeSplashscreenLoader() {
+        Runnable removeLoader = () -> {
+            if (this.splashscreenLoaderOverlay != null) {
+                ViewGroup parent = (ViewGroup) this.splashscreenLoaderOverlay.getParent();
+                if (parent != null) {
+                    parent.removeView(this.splashscreenLoaderOverlay);
+                }
+                this.splashscreenLoaderOverlay = null;
+            }
+        };
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            removeLoader.run();
+        } else {
+            this.mainHandler.post(removeLoader);
+        }
+    }
+
+    private void scheduleSplashscreenTimeout() {
+        if (this.autoSplashscreenTimeout == null || this.autoSplashscreenTimeout <= 0) {
+            return;
+        }
+
+        cancelSplashscreenTimeout();
+
+        this.splashscreenTimeoutRunnable = () -> {
+            logger.info("autoSplashscreen timeout reached, hiding splashscreen");
+            this.autoSplashscreenTimedOut = true;
+            this.implementation.directUpdate = false;
+            hideSplashscreen();
+        };
+
+        this.mainHandler.postDelayed(this.splashscreenTimeoutRunnable, this.autoSplashscreenTimeout);
+    }
+
+    private void cancelSplashscreenTimeout() {
+        if (this.splashscreenTimeoutRunnable != null) {
+            this.mainHandler.removeCallbacks(this.splashscreenTimeoutRunnable);
+            this.splashscreenTimeoutRunnable = null;
         }
     }
 
@@ -421,6 +540,9 @@ public class CapacitorUpdaterPlugin extends Plugin {
     }
 
     private boolean shouldUseDirectUpdate() {
+        if (Boolean.TRUE.equals(this.autoSplashscreenTimedOut)) {
+            return false;
+        }
         switch (this.directUpdateMode) {
             case "false":
                 return false;
@@ -436,6 +558,10 @@ public class CapacitorUpdaterPlugin extends Plugin {
             default:
                 return false;
         }
+    }
+
+    private boolean isDirectUpdateCurrentlyAllowed(final boolean plannedDirectUpdate) {
+        return plannedDirectUpdate && !Boolean.TRUE.equals(this.autoSplashscreenTimedOut);
     }
 
     private void directUpdateFinish(final BundleInfo latest) {
@@ -1271,9 +1397,12 @@ public class CapacitorUpdaterPlugin extends Plugin {
     }
 
     private Thread backgroundDownload() {
-        boolean shouldDirectUpdate = this.shouldUseDirectUpdate();
-        this.implementation.directUpdate = shouldDirectUpdate;
-        String messageUpdate = shouldDirectUpdate ? "Update will occur now." : "Update will occur next time app moves to background.";
+        final boolean plannedDirectUpdate = this.shouldUseDirectUpdate();
+        final boolean initialDirectUpdateAllowed = this.isDirectUpdateCurrentlyAllowed(plannedDirectUpdate);
+        this.implementation.directUpdate = initialDirectUpdateAllowed;
+        final String messageUpdate = initialDirectUpdateAllowed
+            ? "Update will occur now."
+            : "Update will occur next time app moves to background.";
         return startNewThread(() -> {
             logger.info("Check for update via: " + CapacitorUpdaterPlugin.this.updateUrl);
             try {
@@ -1292,7 +1421,7 @@ public class CapacitorUpdaterPlugin extends Plugin {
                                 latestVersion,
                                 current,
                                 true,
-                                shouldDirectUpdate
+                                plannedDirectUpdate
                             );
                         } else {
                             CapacitorUpdaterPlugin.this.endBackGroundTaskWithNotif(
@@ -1300,7 +1429,7 @@ public class CapacitorUpdaterPlugin extends Plugin {
                                 latestVersion,
                                 current,
                                 true,
-                                shouldDirectUpdate,
+                                plannedDirectUpdate,
                                 "backend_refusal",
                                 "backendRefused"
                             );
@@ -1322,7 +1451,7 @@ public class CapacitorUpdaterPlugin extends Plugin {
                                 latestVersion,
                                 current,
                                 true,
-                                shouldDirectUpdate,
+                                plannedDirectUpdate,
                                 "backend_refusal",
                                 "backendRefused"
                             );
@@ -1333,7 +1462,8 @@ public class CapacitorUpdaterPlugin extends Plugin {
 
                         if ("builtin".equals(latestVersionName)) {
                             logger.info("Latest version is builtin");
-                            if (shouldDirectUpdate) {
+                            final boolean directUpdateAllowedNow = CapacitorUpdaterPlugin.this.isDirectUpdateCurrentlyAllowed(plannedDirectUpdate);
+                            if (directUpdateAllowedNow) {
                                 logger.info("Direct update to builtin version");
                                 this._reset(false);
                                 CapacitorUpdaterPlugin.this.endBackGroundTaskWithNotif(
@@ -1344,6 +1474,9 @@ public class CapacitorUpdaterPlugin extends Plugin {
                                     true
                                 );
                             } else {
+                                if (plannedDirectUpdate && !directUpdateAllowedNow) {
+                                    logger.info("Direct update skipped because splashscreen timeout occurred. Update will be applied later.");
+                                }
                                 logger.info("Setting next bundle to builtin");
                                 CapacitorUpdaterPlugin.this.implementation.setNextBundle(BundleInfo.ID_BUILTIN);
                                 CapacitorUpdaterPlugin.this.endBackGroundTaskWithNotif(
@@ -1363,7 +1496,7 @@ public class CapacitorUpdaterPlugin extends Plugin {
                                 current.getVersionName(),
                                 current,
                                 true,
-                                shouldDirectUpdate
+                                plannedDirectUpdate
                             );
                             return;
                         }
@@ -1382,13 +1515,14 @@ public class CapacitorUpdaterPlugin extends Plugin {
                                         latestVersionName,
                                         current,
                                         true,
-                                        shouldDirectUpdate
+                                        plannedDirectUpdate
                                     );
                                     return;
                                 }
                                 if (latest.isDownloaded()) {
                                     logger.info("Latest bundle already exists and download is NOT required. " + messageUpdate);
-                                    if (shouldDirectUpdate) {
+                                    final boolean directUpdateAllowedNow = CapacitorUpdaterPlugin.this.isDirectUpdateCurrentlyAllowed(plannedDirectUpdate);
+                                    if (directUpdateAllowedNow) {
                                         String delayUpdatePreferences = prefs.getString(DelayUpdateUtils.DELAY_CONDITION_PREFERENCES, "[]");
                                         ArrayList<DelayCondition> delayConditionList = delayUpdateUtils.parseDelayConditions(
                                             delayUpdatePreferences
@@ -1400,7 +1534,7 @@ public class CapacitorUpdaterPlugin extends Plugin {
                                                 latestVersionName,
                                                 latest,
                                                 false,
-                                                shouldDirectUpdate
+                                                plannedDirectUpdate
                                             );
                                             return;
                                         }
@@ -1414,6 +1548,9 @@ public class CapacitorUpdaterPlugin extends Plugin {
                                             true
                                         );
                                     } else {
+                                        if (plannedDirectUpdate && !directUpdateAllowedNow) {
+                                            logger.info("Direct update skipped because splashscreen timeout occurred. Update will install on next background.");
+                                        }
                                         CapacitorUpdaterPlugin.this.notifyListeners("updateAvailable", ret);
                                         CapacitorUpdaterPlugin.this.implementation.setNextBundle(latest.getId());
                                         CapacitorUpdaterPlugin.this.endBackGroundTaskWithNotif(
@@ -1479,7 +1616,7 @@ public class CapacitorUpdaterPlugin extends Plugin {
                                         latestVersionName,
                                         CapacitorUpdaterPlugin.this.implementation.getCurrentBundle(),
                                         true,
-                                        shouldDirectUpdate
+                                        plannedDirectUpdate
                                     );
                                 }
                             });
@@ -1494,7 +1631,7 @@ public class CapacitorUpdaterPlugin extends Plugin {
                             current.getVersionName(),
                             current,
                             true,
-                            shouldDirectUpdate
+                            plannedDirectUpdate
                         );
                     }
                 });
@@ -1506,7 +1643,7 @@ public class CapacitorUpdaterPlugin extends Plugin {
                     current.getVersionName(),
                     current,
                     true,
-                    shouldDirectUpdate
+                    plannedDirectUpdate
                 );
             }
         });
