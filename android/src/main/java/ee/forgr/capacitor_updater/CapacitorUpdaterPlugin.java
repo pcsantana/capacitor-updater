@@ -195,7 +195,6 @@ public class CapacitorUpdaterPlugin extends Plugin {
                 this.prefs,
                 this.editor,
                 this.currentVersionNative,
-                CapacitorUpdaterPlugin.this::installNext,
                 logger
             );
         } catch (final PackageManager.NameNotFoundException e) {
